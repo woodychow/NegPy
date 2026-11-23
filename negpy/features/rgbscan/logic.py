@@ -69,6 +69,27 @@ def _channel_means(mosaic: np.ndarray, colors: np.ndarray, black: float) -> Tupl
     )
 
 
+def _tile_channel_means(mosaic: np.ndarray, tile: np.ndarray, black: float) -> Tuple[float, float, float]:
+    """Exact per-CFA-channel means straight off an integer mosaic and its repeating CFA tile,
+    avoiding both the full-sensor float32 copy and rawpy's full-sensor raw_colors_visible build."""
+    th, tw = tile.shape
+    sums = [0, 0, 0]
+    counts = [0, 0, 0]
+    for r in range(th):
+        for c in range(tw):
+            code = int(tile[r, c])
+            grp = 1 if code in (1, 3) else (0 if code == 0 else (2 if code == 2 else -1))
+            if grp >= 0:
+                sub = mosaic[r::th, c::tw]
+                sums[grp] += int(sub.sum(dtype=np.uint64))
+                counts[grp] += sub.size
+    return (
+        (sums[0] / counts[0] - black) if counts[0] else 0.0,
+        (sums[1] / counts[1] - black) if counts[1] else 0.0,
+        (sums[2] / counts[2] - black) if counts[2] else 0.0,
+    )
+
+
 def _scene_signature(mosaic: np.ndarray, black: float) -> np.ndarray:
     """Edge structure of the frame interior, as a z-scored gradient map of density.
 
@@ -83,7 +104,14 @@ def _scene_signature(mosaic: np.ndarray, black: float) -> np.ndarray:
     hh, ww = (h // block) * block, (w // block) * block
     if hh < block or ww < block:
         return np.zeros((1, 1), dtype=np.float32)
-    small = mosaic[:hh, :ww].reshape(hh // block, block, ww // block, block).mean(axis=(1, 3)) - black
+    if np.issubdtype(mosaic.dtype, np.integer):
+        small = (
+            mosaic[:hh, :ww].reshape(hh // block, block, ww // block, block).sum(axis=(1, 3), dtype=np.uint64).astype(np.float64)
+            / (block * block)
+            - black
+        )
+    else:
+        small = mosaic[:hh, :ww].reshape(hh // block, block, ww // block, block).mean(axis=(1, 3)) - black
 
     sh, sw = small.shape
     dh, dw = int(sh * (1.0 - _SIG_INTERIOR) / 2), int(sw * (1.0 - _SIG_INTERIOR) / 2)
@@ -111,10 +139,17 @@ def probe_frame(path: str) -> FrameProbe:
     import rawpy
 
     with rawpy.imread(path) as raw:
-        mosaic = raw.raw_image_visible.astype(np.float32)
-        colors = raw.raw_colors_visible
+        mosaic = raw.raw_image_visible
         black = float(np.mean(raw.black_level_per_channel))
-        return FrameProbe(means=_channel_means(mosaic, colors, black), signature=_scene_signature(mosaic, black))
+        pattern = getattr(raw, "raw_pattern", None)
+        if pattern is not None and pattern.size > 0 and mosaic.ndim == 2 and np.issubdtype(mosaic.dtype, np.integer):
+            th, tw = pattern.shape
+            top, left = int(raw.sizes.top_margin), int(raw.sizes.left_margin)
+            tile = np.array([[raw.raw_color(top + r, left + c) for c in range(tw)] for r in range(th)], dtype=np.uint8)
+            means = _tile_channel_means(mosaic, tile, black)
+        else:
+            means = _channel_means(mosaic.astype(np.float32, copy=False), raw.raw_colors_visible, black)
+        return FrameProbe(means=means, signature=_scene_signature(mosaic, black))
 
 
 def probe_channel_means(path: str) -> Tuple[float, float, float]:

@@ -926,3 +926,41 @@ def test_prefetch_linear_preview_rgb_warms_merged_triplet_cache(tmp_path, monkey
     # Subsequent foreground open is an instant cache hit (0 additional decodes).
     pm.load_linear_preview_rgb(str(red), rgbscan, "Adobe RGB", use_camera_wb=False, file_hash="trip1")
     assert len(decode_calls) == 3
+
+
+def test_tile_channel_means_and_uint16_signature_match_float32_oracle():
+    """Direct uint16 mosaic probing must match the full float32 + raw_colors_visible path."""
+    from negpy.features.rgbscan.logic import _channel_means, _scene_signature, _tile_channel_means
+
+    rng = np.random.default_rng(19)
+    h, w = 513, 769  # odd dimensions so partial trailing CFA tiles are exercised too
+    u16 = rng.integers(300, 18000, size=(h, w), dtype=np.uint16)
+    tile = np.array([[0, 1], [3, 2]], dtype=np.uint8)
+    colors = np.tile(tile, (h // 2 + 1, w // 2 + 1))[:h, :w]
+    black = 512.0
+
+    f32 = u16.astype(np.float32)
+    assert _tile_channel_means(u16, tile, black) == pytest.approx(_channel_means(f32, colors, black), abs=1e-2)
+    sig_u16 = _scene_signature(u16, black)
+    sig_f32 = _scene_signature(f32, black)
+    assert frame_affinity(sig_u16, sig_f32) > 0.999999
+    assert np.allclose(sig_u16, sig_f32, atol=1e-4)
+
+
+def test_bounded_triplet_thumbnail_decodes_concurrently(monkeypatch):
+    import threading
+    from PIL import Image
+    from negpy.services.assets import thumbnails
+
+    barrier = threading.Barrier(3, timeout=3.0)
+
+    def concurrent_bounded(path, max_edge, **_kw):
+        barrier.wait()
+        rgb = {"r.arw": (200, 10, 10), "g.arw": (10, 210, 10), "b.arw": (10, 10, 220)}[path]
+        return Image.new("RGB", (16, 16), rgb)
+
+    monkeypatch.setattr(thumbnails.loader_factory, "load_bounded_preview", concurrent_bounded)
+    out = thumbnails.decode_bounded_source_preview("r.arw", "g.arw", "b.arw", max_edge=64)
+    assert out is not None
+    arr = np.asarray(out)
+    assert tuple(arr[0, 0]) == (200, 210, 220)

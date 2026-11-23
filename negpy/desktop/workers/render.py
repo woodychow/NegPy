@@ -1194,7 +1194,7 @@ class AssetDiscoveryWorker(QObject):
         # An infrared exposure shot beside a triplet (`_IR`) stays its own frame: gray, it would
         # classify as a channel and shift every chunk after it.
         candidates = [p for p in ordered if not os.path.splitext(os.path.basename(p))[0].lower().endswith("_ir")]
-        probes = self._map_files(candidates, probe_frame, lambda p: f"RGB {os.path.basename(p)}", _DECODE_WORKERS)
+        probes = self._map_files(candidates, probe_frame, lambda p: f"RGB {os.path.basename(p)}", max(1, APP_CONFIG.max_workers))
         items = [(p, classify_channel(pr.means)) for p, pr in zip(candidates, probes) if pr is not None]
         signatures = {p: pr.signature for p, pr in zip(candidates, probes) if pr is not None}
 
@@ -1973,20 +1973,31 @@ class ThumbnailRenderWorker(QObject):
         from negpy.services.assets.half_frame import base_hash, slice_for_asset
 
         config = frame.config
-        if self._live_preview_service is None or stitch_active(config.stitch) or hdr_active(config.hdr) or is_rgb_triplet(config.rgbscan):
+        if self._live_preview_service is None or stitch_active(config.stitch) or hdr_active(config.hdr):
             return None
-        hit = self._live_preview_service.peek_linear_preview(
-            frame.file_info["path"],
-            workspace_color_space,
-            use_camera_wb=not effective_linear_raw(config.process),
-            file_hash=base_hash(frame.file_info.get("hash")),
-            demosaic=config.process.demosaic_preview,
-            positive_decode=positive_decode(config.process),
-            highlight_mode=effective_highlight_reconstruction(config.process),
-            bake_camera_wb=highlight_reconstruction_bakes_wb(config.process),
-            lens_corrections=metadata_lens_corrections(config),
-            lens_flatfield=config.flatfield,
-        )
+        if is_rgb_triplet(config.rgbscan):
+            if not hasattr(self._live_preview_service, "peek_linear_preview_rgb"):
+                return None
+            hit = self._live_preview_service.peek_linear_preview_rgb(
+                config.rgbscan,
+                workspace_color_space,
+                use_camera_wb=not effective_linear_raw(config.process),
+                file_hash=base_hash(frame.file_info.get("hash")),
+                demosaic=config.process.demosaic_preview,
+            )
+        else:
+            hit = self._live_preview_service.peek_linear_preview(
+                frame.file_info["path"],
+                workspace_color_space,
+                use_camera_wb=not effective_linear_raw(config.process),
+                file_hash=base_hash(frame.file_info.get("hash")),
+                demosaic=config.process.demosaic_preview,
+                positive_decode=positive_decode(config.process),
+                highlight_mode=effective_highlight_reconstruction(config.process),
+                bake_camera_wb=highlight_reconstruction_bakes_wb(config.process),
+                lens_corrections=metadata_lens_corrections(config),
+                lens_flatfield=config.flatfield,
+            )
         logger.debug("thumbnail refresh live cache %s: %s", "miss" if hit is None else "hit", frame.file_info["path"])
         if hit is None:
             return None
