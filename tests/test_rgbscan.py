@@ -864,3 +864,65 @@ def test_export_triplet_keeps_an_aligned_overshoot_saturated(tmp_path, monkeypat
 
     assert f32.dtype == np.float32
     assert f32.min() >= 1.0
+
+
+def test_load_linear_preview_rgb_decodes_three_exposures_concurrently(tmp_path):
+    """All three narrowband exposures of a triplet must enter load_linear_preview in parallel."""
+    import threading
+    from negpy.services.rendering.preview_manager import PreviewManager
+
+    red, green, blue = (tmp_path / f"{c}.arw" for c in "rgb")
+    for p in (red, green, blue):
+        p.write_bytes(b"x")
+
+    barrier = threading.Barrier(3, timeout=3.0)
+    pm = PreviewManager()
+
+    def concurrent_decode(path, *_a, **_k):
+        barrier.wait()
+        val = {str(red): 0.2, str(green): 0.5, str(blue): 0.8}[path]
+        return np.full((8, 8, 3), val, dtype=np.float32), (8, 8), {"color_space": "Adobe RGB"}
+
+    pm.load_linear_preview = concurrent_decode
+    rgbscan = RgbScanConfig(enabled=True, green_path=str(green), blue_path=str(blue), align=False)
+    merged, dims, _meta = pm.load_linear_preview_rgb(str(red), rgbscan, "Adobe RGB", file_hash="h1")
+
+    assert dims == (8, 8)
+    assert np.allclose(merged[..., 0], 0.2)
+    assert np.allclose(merged[..., 1], 0.5)
+    assert np.allclose(merged[..., 2], 0.8)
+
+
+def test_prefetch_linear_preview_rgb_warms_merged_triplet_cache(tmp_path, monkeypatch):
+    from negpy.infrastructure.loaders.memory import PreviewMemoryEstimate
+    from negpy.services.rendering import preview_manager as pm_mod
+    from negpy.services.rendering.preview_manager import PreviewManager
+
+    red, green, blue = (tmp_path / f"{c}.arw" for c in "rgb")
+    for p in (red, green, blue):
+        p.write_bytes(b"raw")
+
+    monkeypatch.setattr(pm_mod, "available_system_memory_bytes", lambda: 8 * 1024**3)
+    monkeypatch.setattr(
+        pm_mod.loader_factory,
+        "estimate_linear_preview_prefetch_memory",
+        lambda *_a, **_k: PreviewMemoryEstimate(cached_bytes=1024, temporary_bytes=2048, source_dimensions=(8, 8)),
+    )
+
+    pm = PreviewManager()
+    decode_calls = []
+
+    def fake_decode(path, *_a, **_k):
+        decode_calls.append(path)
+        return np.ones((4, 4, 3), dtype=np.float32), (4, 4), {"color_space": "Adobe RGB"}
+
+    pm.load_linear_preview = fake_decode
+    rgbscan = RgbScanConfig(enabled=True, green_path=str(green), blue_path=str(blue), align=False)
+
+    assert pm.prefetch_linear_preview_rgb(str(red), rgbscan, "Adobe RGB", use_camera_wb=False, file_hash="trip1")
+    assert len(decode_calls) == 3
+    assert pm.peek_linear_preview_rgb(rgbscan, "Adobe RGB", use_camera_wb=False, file_hash="trip1") is not None
+
+    # Subsequent foreground open is an instant cache hit (0 additional decodes).
+    pm.load_linear_preview_rgb(str(red), rgbscan, "Adobe RGB", use_camera_wb=False, file_hash="trip1")
+    assert len(decode_calls) == 3

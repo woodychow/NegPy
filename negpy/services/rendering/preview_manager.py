@@ -1,6 +1,9 @@
 import os
+import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from typing import Any, Optional, Sequence, Tuple
 
 import negpy_core
@@ -41,8 +44,9 @@ from negpy.kernel.system.logging import get_logger
 from negpy.kernel.system.memory import available_system_memory_bytes
 from negpy.features.process.logic import highlight_reconstruction_bright_gain
 from negpy.features.process.models import DemosaicMode
-from negpy.services.rendering.preview_cache import PreviewBufferCache, PreviewCacheKey
-from negpy.services.rendering.prefetch_policy import decide_prefetch
+from negpy.services.rendering.preview_cache import PreviewBufferCache, PreviewCacheKey, PreviewCacheUsage
+from negpy.services.rendering.prefetch_policy import PrefetchDecision, decide_prefetch
+from negpy.infrastructure.loaders.memory import PreviewMemoryEstimate
 
 logger = get_logger(__name__)
 
@@ -114,6 +118,66 @@ class PreviewManager:
 
     def __init__(self) -> None:
         self._cache = PreviewBufferCache(APP_CONFIG)
+        self._prefetch_lock = threading.Lock()
+        self._inflight_ram_bytes = 0
+        self._inflight_cache_bytes = 0
+        self._inflight_cache_entries = 0
+
+    @contextmanager
+    def _reserve_prefetch_budget(
+        self,
+        key: PreviewCacheKey,
+        estimate: PreviewMemoryEstimate,
+        protected_hashes: frozenset[str],
+        integrated_gpu: bool,
+    ) -> Iterator[tuple[bool, Optional[PrefetchDecision]]]:
+        """Atomically check and reserve RAM + cache headroom across concurrent prefetch workers."""
+        reserved = False
+        ram_hold = estimate.temporary_bytes + estimate.cached_bytes
+        cache_hold = estimate.cached_bytes
+        with self._prefetch_lock:
+            if self._cache.contains(key):
+                already_warm = True
+                decision: Optional[PrefetchDecision] = None
+            else:
+                already_warm = False
+                usage = self._cache.usage(
+                    protected_file_hashes=protected_hashes,
+                    preserve_full_resolution=True,
+                )
+                used_free_n = min(usage.entries_remaining, self._inflight_cache_entries)
+                rem_n = self._inflight_cache_entries - used_free_n
+                used_free_b = min(usage.bytes_remaining, self._inflight_cache_bytes)
+                rem_b = self._inflight_cache_bytes - used_free_b
+                adj_usage = PreviewCacheUsage(
+                    entries=usage.entries + self._inflight_cache_entries,
+                    bytes_used=usage.bytes_used + self._inflight_cache_bytes,
+                    entries_remaining=usage.entries_remaining - used_free_n,
+                    bytes_remaining=usage.bytes_remaining - used_free_b,
+                    reclaimable_entries=max(0, usage.reclaimable_entries - rem_n),
+                    reclaimable_bytes=max(0, usage.reclaimable_bytes - rem_b),
+                )
+                avail = available_system_memory_bytes()
+                adj_avail = None if avail is None else max(0, avail - self._inflight_ram_bytes)
+                decision = decide_prefetch(
+                    estimate,
+                    adj_usage,
+                    adj_avail,
+                    integrated_gpu=integrated_gpu,
+                )
+                if decision.allowed:
+                    self._inflight_ram_bytes += ram_hold
+                    self._inflight_cache_bytes += cache_hold
+                    self._inflight_cache_entries += 1
+                    reserved = True
+        try:
+            yield already_warm, decision
+        finally:
+            if reserved:
+                with self._prefetch_lock:
+                    self._inflight_ram_bytes = max(0, self._inflight_ram_bytes - ram_hold)
+                    self._inflight_cache_bytes = max(0, self._inflight_cache_bytes - cache_hold)
+                    self._inflight_cache_entries = max(0, self._inflight_cache_entries - 1)
 
     def prefetch_linear_preview(
         self,
@@ -157,46 +221,128 @@ class PreviewManager:
         estimate = loader_factory.estimate_linear_preview_prefetch_memory(file_path, APP_CONFIG.preview_render_size)
 
         protected_hashes = frozenset(protected_file_hashes)
-        decision = decide_prefetch(
-            estimate,
-            self._cache.usage(
-                protected_file_hashes=protected_hashes,
-                preserve_full_resolution=True,
-            ),
-            available_system_memory_bytes(),
-            integrated_gpu=integrated_gpu,
-        )
-        if not decision.allowed:
-            logger.debug(
-                "preview prefetch skip: %s (cache=%d B temporary=%d B required_ram=%d B) %s",
-                decision.reason,
-                estimate.cached_bytes,
-                estimate.temporary_bytes,
-                decision.required_ram_bytes,
+        with self._reserve_prefetch_budget(key, estimate, protected_hashes, integrated_gpu) as (already_warm, decision):
+            if already_warm:
+                return True
+            assert decision is not None
+            if not decision.allowed:
+                logger.debug(
+                    "preview prefetch skip: %s (cache=%d B temporary=%d B required_ram=%d B) %s",
+                    decision.reason,
+                    estimate.cached_bytes,
+                    estimate.temporary_bytes,
+                    decision.required_ram_bytes,
+                    file_path,
+                )
+                return False
+            if should_cancel is not None and should_cancel():
+                raise InterruptedError("preview load cancelled")
+
+            self.load_linear_preview(
                 file_path,
+                color_space,
+                use_camera_wb=use_camera_wb,
+                full_resolution=False,
+                file_hash=file_hash,
+                half_slice=half_slice,
+                demosaic=demosaic,
+                positive_decode=positive_decode,
+                cache_protected_file_hashes=protected_hashes,
+                cache_preserve_full_resolution=True,
+                should_cancel=should_cancel,
+                highlight_mode=highlight_mode,
+                bake_camera_wb=bake_camera_wb,
+                lens_corrections=lens_corrections,
+                lens_flatfield=lens_flatfield,
             )
+            return True
+
+    def prefetch_linear_preview_rgb(
+        self,
+        red_path: str,
+        rgbscan: RgbScanConfig,
+        color_space: str,
+        *,
+        use_camera_wb: bool,
+        file_hash: str | None,
+        demosaic: str = DemosaicMode.AUTO,
+        integrated_gpu: bool = False,
+        protected_file_hashes: tuple[str, ...] = (),
+        should_cancel: Optional[Callable[[], bool]] = None,
+    ) -> bool:
+        """Warm one merged trichrome preview when cache and RAM budgets admit all three exposures."""
+        token = rgbscan_token(rgbscan)
+        if not file_hash or not token:
             return False
+        key = PreviewCacheKey(
+            file_hash=f"rgb|{file_hash}|{token}",
+            use_camera_wb=use_camera_wb,
+            workspace_color_space=color_space,
+            full_resolution=False,
+            demosaic=demosaic,
+        )
+        if self._cache.contains(key):
+            return True
         if should_cancel is not None and should_cancel():
             raise InterruptedError("preview load cancelled")
 
-        self.load_linear_preview(
-            file_path,
-            color_space,
-            use_camera_wb=use_camera_wb,
-            full_resolution=False,
-            file_hash=file_hash,
-            half_slice=half_slice,
-            demosaic=demosaic,
-            positive_decode=positive_decode,
-            cache_protected_file_hashes=protected_hashes,
-            cache_preserve_full_resolution=True,
-            should_cancel=should_cancel,
-            highlight_mode=highlight_mode,
-            bake_camera_wb=bake_camera_wb,
-            lens_corrections=lens_corrections,
-            lens_flatfield=lens_flatfield,
+        est_r = loader_factory.estimate_linear_preview_prefetch_memory(red_path, APP_CONFIG.preview_render_size)
+        est_g = loader_factory.estimate_linear_preview_prefetch_memory(rgbscan.green_path, APP_CONFIG.preview_render_size)
+        est_b = loader_factory.estimate_linear_preview_prefetch_memory(rgbscan.blue_path, APP_CONFIG.preview_render_size)
+        estimate = PreviewMemoryEstimate(
+            cached_bytes=est_r.cached_bytes,
+            temporary_bytes=(
+                est_g.cached_bytes + est_b.cached_bytes + est_r.temporary_bytes + est_g.temporary_bytes + est_b.temporary_bytes
+            ),
+            source_dimensions=est_r.source_dimensions,
         )
-        return True
+        protected_hashes = frozenset(protected_file_hashes)
+        with self._reserve_prefetch_budget(key, estimate, protected_hashes, integrated_gpu) as (already_warm, decision):
+            if already_warm:
+                return True
+            assert decision is not None
+            if not decision.allowed:
+                return False
+            if should_cancel is not None and should_cancel():
+                raise InterruptedError("preview load cancelled")
+
+            self.load_linear_preview_rgb(
+                red_path,
+                rgbscan,
+                color_space,
+                use_camera_wb=use_camera_wb,
+                full_resolution=False,
+                file_hash=file_hash,
+                demosaic=demosaic,
+                should_cancel=should_cancel,
+                cache_protected_file_hashes=protected_hashes,
+                cache_preserve_full_resolution=True,
+                prefetch=True,
+            )
+            return True
+
+    def peek_linear_preview_rgb(
+        self,
+        rgbscan: RgbScanConfig,
+        color_space: str,
+        *,
+        use_camera_wb: bool,
+        file_hash: str | None,
+        full_resolution: bool = False,
+        demosaic: str = DemosaicMode.AUTO,
+    ) -> Optional[Tuple[ImageBuffer, Dimensions, dict]]:
+        """Cached ``load_linear_preview_rgb`` result, or None; never decodes or reorders the LRU."""
+        token = rgbscan_token(rgbscan)
+        if not file_hash or not token:
+            return None
+        key = PreviewCacheKey(
+            file_hash=f"rgb|{file_hash}|{token}",
+            use_camera_wb=use_camera_wb,
+            workspace_color_space=color_space,
+            full_resolution=full_resolution,
+            demosaic=demosaic,
+        )
+        return self._cache.peek(key)
 
     def peek_linear_preview(
         self,
@@ -706,6 +852,9 @@ class PreviewManager:
         file_hash: str | None = None,
         demosaic: str = DemosaicMode.AUTO,
         should_cancel: Optional[Callable[[], bool]] = None,
+        cache_protected_file_hashes: frozenset[str] = frozenset(),
+        cache_preserve_full_resolution: bool = False,
+        prefetch: bool = False,
     ) -> Tuple[ImageBuffer, Dimensions, dict]:
         """Merge a narrowband R/G/B triplet into one linear preview: red channel from the
         red shot, green from green, blue from blue. The merged result is cached, so re-visiting
@@ -734,15 +883,42 @@ class PreviewManager:
             if hit is not None:
                 return hit  # cache hit — caller must not mutate this buffer
 
-        red_out, dims, meta = self.load_linear_preview(
-            red_path, color_space, False, full_resolution, file_hash, demosaic=demosaic, should_cancel=should_cancel
-        )
-        green_out, _, _ = self.load_linear_preview(
-            green_path, color_space, False, full_resolution, None, demosaic=demosaic, should_cancel=should_cancel
-        )
-        blue_out, _, _ = self.load_linear_preview(
-            blue_path, color_space, False, full_resolution, None, demosaic=demosaic, should_cancel=should_cancel
-        )
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            r_fut = pool.submit(
+                self.load_linear_preview,
+                red_path,
+                color_space,
+                False,
+                full_resolution,
+                None if prefetch else file_hash,
+                demosaic=demosaic,
+                cache_protected_file_hashes=cache_protected_file_hashes,
+                cache_preserve_full_resolution=cache_preserve_full_resolution,
+                should_cancel=should_cancel,
+            )
+            g_fut = pool.submit(
+                self.load_linear_preview,
+                green_path,
+                color_space,
+                False,
+                full_resolution,
+                None,
+                demosaic=demosaic,
+                should_cancel=should_cancel,
+            )
+            b_fut = pool.submit(
+                self.load_linear_preview,
+                blue_path,
+                color_space,
+                False,
+                full_resolution,
+                None,
+                demosaic=demosaic,
+                should_cancel=should_cancel,
+            )
+            red_out, dims, meta = r_fut.result()
+            green_out, _, _ = g_fut.result()
+            blue_out, _, _ = b_fut.result()
 
         red = np.asarray(red_out, dtype=np.float32)
 
@@ -761,7 +937,14 @@ class PreviewManager:
         meta["camera_wb"] = None
         if merged_key is not None:
             # A freshly assembled buffer: the cache and the caller alias it, read-only.
-            self._cache.put(merged_key, out, dims, dict(meta))
+            self._cache.put(
+                merged_key,
+                out,
+                dims,
+                dict(meta),
+                protected_file_hashes=cache_protected_file_hashes,
+                preserve_full_resolution=cache_preserve_full_resolution,
+            )
         return out, dims, meta
 
     def load_linear_preview_hdr(

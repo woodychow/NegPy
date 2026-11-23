@@ -1321,37 +1321,59 @@ class PreviewLoadWorker(QObject):
             with _DECODE_MEMORY_GATE.hold("prefetch", task.file_path):
                 if not self._prefetch_is_current(task):
                     return
-                self._preview_service.prefetch_linear_preview(
-                    task.file_path,
-                    task.workspace_color_space,
-                    use_camera_wb=task.use_camera_wb,
-                    file_hash=task.file_hash,
-                    half_slice=task.half_slice,
-                    demosaic=task.demosaic,
-                    positive_decode=task.positive_decode,
-                    integrated_gpu=task.integrated_gpu,
-                    protected_file_hashes=task.protected_file_hashes,
-                    should_cancel=lambda: not self._prefetch_is_current(task),
-                    highlight_mode=task.highlight_mode,
-                    bake_camera_wb=task.bake_camera_wb,
-                    lens_corrections=task.lens_corrections,
-                    lens_flatfield=task.lens_flatfield,
-                )
+                if is_rgb_triplet(task.rgbscan):
+                    self._preview_service.prefetch_linear_preview_rgb(
+                        task.file_path,
+                        task.rgbscan,
+                        task.workspace_color_space,
+                        use_camera_wb=task.use_camera_wb,
+                        file_hash=task.file_hash,
+                        demosaic=task.demosaic,
+                        integrated_gpu=task.integrated_gpu,
+                        protected_file_hashes=task.protected_file_hashes,
+                        should_cancel=lambda: not self._prefetch_is_current(task),
+                    )
+                else:
+                    self._preview_service.prefetch_linear_preview(
+                        task.file_path,
+                        task.workspace_color_space,
+                        use_camera_wb=task.use_camera_wb,
+                        file_hash=task.file_hash,
+                        half_slice=task.half_slice,
+                        demosaic=task.demosaic,
+                        positive_decode=task.positive_decode,
+                        integrated_gpu=task.integrated_gpu,
+                        protected_file_hashes=task.protected_file_hashes,
+                        should_cancel=lambda: not self._prefetch_is_current(task),
+                        highlight_mode=task.highlight_mode,
+                        bake_camera_wb=task.bake_camera_wb,
+                        lens_corrections=task.lens_corrections,
+                        lens_flatfield=task.lens_flatfield,
+                    )
             # Outside the memory gate: the read holds no decode memory, and a foreground decode
             # of this file must not wait on it.
             if task.base_settings is not None and self._prefetch_is_current(task):
-                cached = self._preview_service.peek_linear_preview(
-                    task.file_path,
-                    task.workspace_color_space,
-                    use_camera_wb=task.use_camera_wb,
-                    file_hash=task.file_hash,
-                    demosaic=task.demosaic,
-                    positive_decode=task.positive_decode,
-                    highlight_mode=task.highlight_mode,
-                    bake_camera_wb=task.bake_camera_wb,
-                    lens_corrections=task.lens_corrections,
-                    lens_flatfield=task.lens_flatfield,
-                )
+                if is_rgb_triplet(task.rgbscan):
+                    cached = self._preview_service.peek_linear_preview_rgb(
+                        task.rgbscan,
+                        task.workspace_color_space,
+                        use_camera_wb=task.use_camera_wb,
+                        file_hash=task.file_hash,
+                        demosaic=task.demosaic,
+                    )
+                else:
+                    cached = self._preview_service.peek_linear_preview(
+                        task.file_path,
+                        task.workspace_color_space,
+                        use_camera_wb=task.use_camera_wb,
+                        file_hash=task.file_hash,
+                        demosaic=task.demosaic,
+                        positive_decode=task.positive_decode,
+                        highlight_mode=task.highlight_mode,
+                        bake_camera_wb=task.bake_camera_wb,
+                        lens_corrections=task.lens_corrections,
+                        lens_flatfield=task.lens_flatfield,
+                    )
                 if cached is not None:
                     buffer, _dims, metadata = cached
                     read_source_base(buffer, task.base_settings, task.file_hash, metadata.get("orientation", 1))

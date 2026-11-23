@@ -1,4 +1,5 @@
 import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -294,14 +295,15 @@ def estimate_shift(ref_gray: np.ndarray, mov_gray: np.ndarray) -> Tuple[float, f
 
 
 def _align_to(ref_gray: np.ndarray, mov: np.ndarray, mov_ch: int, max_shift: float) -> np.ndarray:
-    """Shift ``mov`` so its scene content lines up with ``ref_gray``. No-op if the
-    estimate is implausibly large (correlation failed)."""
-    dx, dy = estimate_shift(ref_gray, mov[..., mov_ch])
+    """Extract ``mov_ch`` and shift it so its scene content lines up with ``ref_gray``. No-op if
+    the estimate is implausibly large (correlation failed)."""
+    plane = negpy_core.extract_channel(np.ascontiguousarray(mov, dtype=np.float32), mov_ch)
+    dx, dy = estimate_shift(ref_gray, plane)
     if max(abs(dx), abs(dy)) > max_shift:
-        return mov
-    h, w = mov.shape[:2]
-    matrix = np.array([[1.0, 0.0, -dx], [0.0, 1.0, -dy]], dtype=np.float32)
-    return negpy_core.warp_affine(np.ascontiguousarray(mov, dtype=np.float32), matrix.astype(np.float64), (w, h), interpolation="cubic")
+        return mov[..., mov_ch]
+    h, w = plane.shape[:2]
+    matrix = np.array([[1.0, 0.0, -dx], [0.0, 1.0, -dy]], dtype=np.float32).astype(np.float64)
+    return negpy_core.warp_affine(plane, matrix, (w, h), interpolation="cubic")
 
 
 def assemble_rgb(r: np.ndarray, g: np.ndarray, b: np.ndarray, align: bool = True) -> np.ndarray:
@@ -316,8 +318,15 @@ def assemble_rgb(r: np.ndarray, g: np.ndarray, b: np.ndarray, align: bool = True
     if align:
         ref = negpy_core.extract_channel(np.ascontiguousarray(g, dtype=np.float32), GREEN)
         max_shift = max(16.0, 0.02 * r.shape[1])
-        r = _align_to(ref, r, RED, max_shift)
-        b = _align_to(ref, b, BLUE, max_shift)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            r_fut = pool.submit(_align_to, ref, r, RED, max_shift)
+            b_fut = pool.submit(_align_to, ref, b, BLUE, max_shift)
+            r_aligned, b_aligned = r_fut.result(), b_fut.result()
+        r_plane = r_aligned[..., RED] if r_aligned.ndim == 3 else r_aligned
+        b_plane = b_aligned[..., BLUE] if b_aligned.ndim == 3 else b_aligned
+        out_dtype = np.float32 if (r_plane.dtype == np.float32 or b_plane.dtype == np.float32) else r.dtype
+        g_plane = ref if out_dtype == np.float32 else g[..., GREEN]
+        return np.ascontiguousarray(np.stack((r_plane, g_plane, b_plane), axis=-1).astype(out_dtype, copy=False))
     return negpy_core.pick_channels(*(np.ascontiguousarray(x, dtype=r.dtype) for x in (r, g, b)))
 
 

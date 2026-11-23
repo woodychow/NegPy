@@ -1216,6 +1216,26 @@ class TestAppController(unittest.TestCase):
         self.assertEqual(first.protected_file_hashes, ("selected",))
         self.assertEqual(second.protected_file_hashes, ("selected", "previous"))
 
+    def test_neighbor_prefetch_admits_trichrome_triplets_and_skips_stitches(self):
+        from dataclasses import replace
+        from negpy.domain.models import WorkspaceConfig
+        from negpy.features.rgbscan.models import RgbScanConfig
+
+        rgb_cfg = RgbScanConfig(enabled=True, green_path="/tmp/g.arw", blue_path="/tmp/b.arw", align=True)
+        cfg = replace(WorkspaceConfig(), rgbscan=rgb_cfg)
+        self.controller.session.repo.load_file_settings.return_value = None
+        self.controller.session.config_for_asset = MagicMock(return_value=cfg)
+        self.controller.film_base_for = MagicMock(return_value=None)
+
+        triplet = {"path": "/tmp/r.arw", "hash": "trip", "green_path": "/tmp/g.arw", "blue_path": "/tmp/b.arw"}
+        task = self.controller._neighbor_prefetch_task(triplet, generation=2, protected_file_hashes=("sel",))
+        self.assertIsNotNone(task)
+        self.assertEqual(task.rgbscan, rgb_cfg)
+        self.assertIsNone(task.half_slice)
+
+        stitch = {"path": "/tmp/p1.arw", "hash": "st", "stitch_paths": ["/tmp/p1.arw", "/tmp/p2.arw"]}
+        self.assertIsNone(self.controller._neighbor_prefetch_task(stitch, generation=2, protected_file_hashes=()))
+
     def test_render_does_not_wait_for_a_running_neighbor_prefetch(self):
         import numpy as np
 

@@ -3540,7 +3540,7 @@ class AppController(QObject):
         generation: int,
         protected_file_hashes: tuple[str, ...],
     ) -> Optional[PreviewLoadTask]:
-        if is_composite(asset):
+        if asset.get("stitch_paths") or asset.get("hdr_paths"):
             return None
         file_hash = asset.get("hash")
         if not file_hash:
@@ -3551,11 +3551,12 @@ class AppController(QObject):
             integrated_gpu = bool(self.state.gpu_enabled and GPUDevice.get().is_integrated)
         except Exception:
             integrated_gpu = False
-        half_slice = self._half_slice_for_asset(asset["path"], file_hash)
+        half_slice = None if is_composite(asset) else self._half_slice_for_asset(asset["path"], file_hash)
+        config = self.session.config_for_asset(asset) if (half_slice is None or is_composite(asset)) else None
+        rgbscan = config.rgbscan if config is not None else WorkspaceConfig().rgbscan
         # The render reads the base only for a whole negative frame on a roll with no picked base.
         base_settings = None
-        if half_slice is None:
-            config = self.session.config_for_asset(asset)
+        if half_slice is None and config is not None:
             if self.film_base_for(asset, config.process) is None and render_path(config.process) is RenderPath.PRINT:
                 base_settings = config
         return PreviewLoadTask(
@@ -3572,6 +3573,7 @@ class AppController(QObject):
             for_cache_warm=True,
             integrated_gpu=integrated_gpu,
             protected_file_hashes=protected_file_hashes,
+            rgbscan=rgbscan,
             half_slice=half_slice,
             demosaic=saved.process.demosaic_preview if saved else self.state.config.process.demosaic_preview,
             lens_corrections=metadata_lens_corrections(saved or self.state.config),
