@@ -111,6 +111,91 @@ def _linear_preview_key(
     )
 
 
+def _safe_hq_vram_cap() -> Optional[int]:
+    try:
+        return effective_max_texture_size(APP_CONFIG, GPUDevice.get())
+    except Exception:
+        cap = int(getattr(APP_CONFIG, "max_texture_size", 0) or 0)
+        return cap if cap > 0 else None
+
+
+def estimate_rgb_triplet_preview_memory(
+    red_path: str,
+    green_path: str,
+    blue_path: str,
+    max_edge: int,
+    *,
+    demosaic: str = DemosaicMode.AUTO,
+    full_resolution: bool = False,
+) -> PreviewMemoryEstimate:
+    """Estimate merged `(RGB)` preview cache bytes and 3-channel transient decode memory.
+
+    `load_linear_preview_rgb` caches only the merged float32 preview (`12` B/px) plus an
+    optional 3-channel `detect_preview` (`12` B/px when downsampled, never a full-sensor
+    `ir` plane) and decodes each exposure without caching individual channels."""
+    cap_edge = max_edge
+    if full_resolution:
+        vram_cap = _safe_hq_vram_cap()
+        cap_edge = vram_cap if vram_cap is not None else 65536
+    est_r = loader_factory.estimate_linear_preview_prefetch_memory(red_path, cap_edge)
+    est_g = loader_factory.estimate_linear_preview_prefetch_memory(green_path, cap_edge)
+    est_b = loader_factory.estimate_linear_preview_prefetch_memory(blue_path, cap_edge)
+    edge = max(1, int(max_edge))
+    dims = est_r.source_dimensions
+    if dims is not None and dims[0] > 0 and dims[1] > 0:
+        w, h = dims
+        if full_resolution:
+            vram_cap = _safe_hq_vram_cap()
+            if vram_cap is not None and max(w, h) > vram_cap:
+                scale = vram_cap / max(w, h)
+                cw, ch = max(1, int(w * scale)), max(1, int(h * scale))
+                merged_cached = cw * ch * 24
+            else:
+                merged_cached = w * h * 12
+        else:
+            scale = min(1.0, edge / max(w, h))
+            cw, ch = max(1, round(w * scale)), max(1, round(h * scale))
+            merged_cached = cw * ch * (24 if (cw, ch) != (w, h) else 12)
+        cached_bytes = min(est_r.cached_bytes, merged_cached)
+    elif full_resolution:
+        try:
+            r_size = os.path.getsize(red_path)
+        except OSError:
+            r_size = 0
+        hq_fallback = max(r_size * 10, 288 * 1024 * 1024)
+        cached_bytes = min(est_r.cached_bytes, hq_fallback)
+    else:
+        cached_bytes = min(est_r.cached_bytes, edge * edge * 24)
+
+    try:
+        fast_auto = (not full_resolution) and DemosaicMode(demosaic) == DemosaicMode.AUTO
+    except ValueError:
+        fast_auto = False
+
+    def _channel_temp(path: str, est: PreviewMemoryEstimate) -> int:
+        if not fast_auto or loader_factory._select_loader(path) is not loader_factory._rawpy:
+            return est.temporary_bytes
+        try:
+            fsize = os.path.getsize(path)
+        except OSError:
+            fsize = 0
+        cdims = est.source_dimensions
+        if cdims is not None and cdims[0] > 0 and cdims[1] > 0:
+            raw_temp = max(cdims[0] * cdims[1] * 7, fsize * 2, 64 * 1024 * 1024)
+        elif fsize > 0:
+            raw_temp = max(fsize * 4, 128 * 1024 * 1024)
+        else:
+            raw_temp = est.temporary_bytes
+        return min(est.temporary_bytes, raw_temp)
+
+    temporary_bytes = _channel_temp(red_path, est_r) + _channel_temp(green_path, est_g) + _channel_temp(blue_path, est_b)
+    return PreviewMemoryEstimate(
+        cached_bytes=cached_bytes,
+        temporary_bytes=temporary_bytes,
+        source_dimensions=dims,
+    )
+
+
 class PreviewManager:
     """
     Loads RAW (and other) files for UI preview, with in-memory LRU and fast decode.
@@ -143,7 +228,8 @@ class PreviewManager:
                 already_warm = False
                 usage = self._cache.usage(
                     protected_file_hashes=protected_hashes,
-                    preserve_full_resolution=True,
+                    preserve_full_resolution=not key.full_resolution,
+                    for_full_resolution=key.full_resolution,
                 )
                 used_free_n = min(usage.entries_remaining, self._inflight_cache_entries)
                 rem_n = self._inflight_cache_entries - used_free_n
@@ -186,6 +272,7 @@ class PreviewManager:
         *,
         use_camera_wb: bool,
         file_hash: str | None,
+        full_resolution: bool = False,
         half_slice: tuple[int, float, tuple[float, float, float, float] | None, float, str] | None = None,
         demosaic: str = DemosaicMode.AUTO,
         positive_decode: str = "",
@@ -204,7 +291,7 @@ class PreviewManager:
             file_hash,
             color_space=color_space,
             use_camera_wb=use_camera_wb,
-            full_resolution=False,
+            full_resolution=full_resolution,
             half_slice=half_slice,
             demosaic=demosaic,
             positive_decode=positive_decode,
@@ -218,7 +305,22 @@ class PreviewManager:
         if should_cancel is not None and should_cancel():
             raise InterruptedError("preview load cancelled")
 
-        estimate = loader_factory.estimate_linear_preview_prefetch_memory(file_path, APP_CONFIG.preview_render_size)
+        cap_edge = APP_CONFIG.preview_render_size
+        if full_resolution:
+            vram_cap = _safe_hq_vram_cap()
+            cap_edge = vram_cap if vram_cap is not None else 65536
+        estimate = loader_factory.estimate_linear_preview_prefetch_memory(file_path, cap_edge)
+        if full_resolution and estimate.source_dimensions is None:
+            try:
+                fsize = os.path.getsize(file_path)
+            except OSError:
+                fsize = 0
+            hq_fallback = max(fsize * 12, 320 * 1024 * 1024)
+            estimate = PreviewMemoryEstimate(
+                cached_bytes=min(estimate.cached_bytes, hq_fallback),
+                temporary_bytes=estimate.temporary_bytes,
+                source_dimensions=None,
+            )
 
         protected_hashes = frozenset(protected_file_hashes)
         with self._reserve_prefetch_budget(key, estimate, protected_hashes, integrated_gpu) as (already_warm, decision):
@@ -242,13 +344,13 @@ class PreviewManager:
                 file_path,
                 color_space,
                 use_camera_wb=use_camera_wb,
-                full_resolution=False,
+                full_resolution=full_resolution,
                 file_hash=file_hash,
                 half_slice=half_slice,
                 demosaic=demosaic,
                 positive_decode=positive_decode,
                 cache_protected_file_hashes=protected_hashes,
-                cache_preserve_full_resolution=True,
+                cache_preserve_full_resolution=not full_resolution,
                 should_cancel=should_cancel,
                 highlight_mode=highlight_mode,
                 bake_camera_wb=bake_camera_wb,
@@ -265,6 +367,7 @@ class PreviewManager:
         *,
         use_camera_wb: bool,
         file_hash: str | None,
+        full_resolution: bool = False,
         demosaic: str = DemosaicMode.AUTO,
         integrated_gpu: bool = False,
         protected_file_hashes: tuple[str, ...] = (),
@@ -278,7 +381,7 @@ class PreviewManager:
             file_hash=f"rgb|{file_hash}|{token}",
             use_camera_wb=use_camera_wb,
             workspace_color_space=color_space,
-            full_resolution=False,
+            full_resolution=full_resolution,
             demosaic=demosaic,
         )
         if self._cache.contains(key):
@@ -286,15 +389,13 @@ class PreviewManager:
         if should_cancel is not None and should_cancel():
             raise InterruptedError("preview load cancelled")
 
-        est_r = loader_factory.estimate_linear_preview_prefetch_memory(red_path, APP_CONFIG.preview_render_size)
-        est_g = loader_factory.estimate_linear_preview_prefetch_memory(rgbscan.green_path, APP_CONFIG.preview_render_size)
-        est_b = loader_factory.estimate_linear_preview_prefetch_memory(rgbscan.blue_path, APP_CONFIG.preview_render_size)
-        estimate = PreviewMemoryEstimate(
-            cached_bytes=est_r.cached_bytes,
-            temporary_bytes=(
-                est_g.cached_bytes + est_b.cached_bytes + est_r.temporary_bytes + est_g.temporary_bytes + est_b.temporary_bytes
-            ),
-            source_dimensions=est_r.source_dimensions,
+        estimate = estimate_rgb_triplet_preview_memory(
+            red_path,
+            rgbscan.green_path,
+            rgbscan.blue_path,
+            APP_CONFIG.preview_render_size,
+            demosaic=demosaic,
+            full_resolution=full_resolution,
         )
         protected_hashes = frozenset(protected_file_hashes)
         with self._reserve_prefetch_budget(key, estimate, protected_hashes, integrated_gpu) as (already_warm, decision):
@@ -311,13 +412,12 @@ class PreviewManager:
                 rgbscan,
                 color_space,
                 use_camera_wb=use_camera_wb,
-                full_resolution=False,
+                full_resolution=full_resolution,
                 file_hash=file_hash,
                 demosaic=demosaic,
                 should_cancel=should_cancel,
                 cache_protected_file_hashes=protected_hashes,
-                cache_preserve_full_resolution=True,
-                prefetch=True,
+                cache_preserve_full_resolution=not full_resolution,
             )
             return True
 
@@ -854,7 +954,6 @@ class PreviewManager:
         should_cancel: Optional[Callable[[], bool]] = None,
         cache_protected_file_hashes: frozenset[str] = frozenset(),
         cache_preserve_full_resolution: bool = False,
-        prefetch: bool = False,
     ) -> Tuple[ImageBuffer, Dimensions, dict]:
         """Merge a narrowband R/G/B triplet into one linear preview: red channel from the
         red shot, green from green, blue from blue. The merged result is cached, so re-visiting
@@ -890,10 +989,8 @@ class PreviewManager:
                 color_space,
                 False,
                 full_resolution,
-                None if prefetch else file_hash,
+                None,
                 demosaic=demosaic,
-                cache_protected_file_hashes=cache_protected_file_hashes,
-                cache_preserve_full_resolution=cache_preserve_full_resolution,
                 should_cancel=should_cancel,
             )
             g_fut = pool.submit(

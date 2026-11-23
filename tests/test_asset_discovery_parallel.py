@@ -81,6 +81,43 @@ class TestMapFiles(unittest.TestCase):
         out = _worker()._map_files(["only"], lambda p: p.upper(), str, 8)
         self.assertEqual(out, ["ONLY"])
 
+    def test_rgb_grouping_preserves_timestamps_when_non_raw_probe_raises(self):
+        import numpy as np
+
+        from negpy.desktop.workers.render import AssetDiscoveryWorker
+        from negpy.features.rgbscan.logic import BLUE, GREEN, RED, FrameProbe
+
+        worker = AssetDiscoveryWorker()
+        assets = [
+            {"name": "c_b.arw", "path": "/tmp/c_b.arw", "hash": "hb"},
+            {"name": "a_r.arw", "path": "/tmp/a_r.arw", "hash": "hr"},
+            {"name": "b_g.arw", "path": "/tmp/b_g.arw", "hash": "hg"},
+            {"name": "z_note.jpg", "path": "/tmp/z_note.jpg", "hash": "hj"},
+        ]
+        stamps = {
+            "/tmp/a_r.arw": "2026:11:22 10:00:01",
+            "/tmp/b_g.arw": "2026:11:22 10:00:02",
+            "/tmp/c_b.arw": "2026:11:22 10:00:03",
+            "/tmp/z_note.jpg": "2026:11:22 10:00:04",
+        }
+        sig = np.ones(64, dtype=np.float32)
+
+        def fake_probe(path: str):
+            if path.endswith(".jpg"):
+                raise RuntimeError("not a raw mosaic")
+            means = {"a_r.arw": (10.0, 1.0, 1.0), "b_g.arw": (1.0, 10.0, 1.0), "c_b.arw": (1.0, 1.0, 10.0)}[path.split("/")[-1]]
+            return FrameProbe(means=means, signature=sig)
+
+        with (
+            patch("negpy.features.rgbscan.logic.capture_timestamp", side_effect=stamps.__getitem__),
+            patch("negpy.features.rgbscan.logic.probe_frame", side_effect=fake_probe),
+        ):
+            grouped = worker._group_rgb_triplets(assets)
+        self.assertEqual(len(grouped), 2)
+        self.assertEqual(grouped[0]["path"], "/tmp/a_r.arw")
+        self.assertEqual((grouped[0]["green_path"], grouped[0]["blue_path"]), ("/tmp/b_g.arw", "/tmp/c_b.arw"))
+        self.assertEqual((RED, GREEN, BLUE), (0, 1, 2))
+
 
 class TestThumbnailStreaming(unittest.TestCase):
     """The filmstrip queue yields between files and can be cancelled."""
@@ -248,6 +285,36 @@ class TestThumbnailStreaming(unittest.TestCase):
             self.assertTrue(entered.wait(5))
             thread.join(5)
         self.assertFalse(thread.is_alive())
+
+    def test_triplet_thumbnails_decode_concurrently_and_stream_in_order(self):
+        worker = ThumbnailWorker(None)
+        partial: list[dict] = []
+        activity: list[str] = []
+        worker.partial.connect(partial.append)
+        worker.activity.connect(activity.append)
+        barrier = threading.Barrier(2, timeout=5)
+        files = [
+            {"name": f"f{i}", "path": f"/tmp/r{i}.arw", "green_path": f"/tmp/g{i}.arw", "blue_path": f"/tmp/b{i}.arw", "hash": f"h{i}"}
+            for i in range(2)
+        ]
+
+        def generate(path, *_args, **_kwargs):
+            barrier.wait()
+            return Image.new("RGB", (4, 4))
+
+        with (
+            patch.object(render_workers, "_THUMB_TRIPLET_WORKERS", 2),
+            patch.object(render_workers, "available_system_memory_bytes", return_value=4 * 1024 * 1024 * 1024),
+            patch("negpy.services.assets.thumbnails.get_thumbnail_worker", side_effect=generate),
+        ):
+            worker.generate(files)
+            worker._next_timer.stop()
+            while worker._active:
+                worker._process_next()
+                worker._next_timer.stop()
+
+        self.assertEqual([list(chunk.keys()) for chunk in partial], [["h0-rgb-v3"], ["h1-rgb-v3"]])
+        self.assertEqual(activity, ["h0-rgb-v3", "h1-rgb-v3", ""])
 
 
 if __name__ == "__main__":
