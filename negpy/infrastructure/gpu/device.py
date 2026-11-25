@@ -88,6 +88,9 @@ class GPUDevice:
                 return
             try:
                 if inst.device is not None:
+                    from negpy.infrastructure.gpu.resources import destroy_downsample_resources
+
+                    destroy_downsample_resources()
                     inst.device.destroy()
                     inst.device = None
                 inst.adapter = None

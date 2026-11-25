@@ -16,16 +16,26 @@ from negpy.kernel.system.config import DEFAULT_WORKSPACE_CONFIG
 
 
 class _FakeTexture:
-    """Stands in for GPUTexture; counts full readbacks."""
+    """Stands in for GPUTexture; counts full and downsampled readbacks."""
 
     def __init__(self, array):
         self._array = array
         self.height, self.width = array.shape[:2]
         self.readbacks = 0
+        self.downsampled_readbacks = 0
+        self.last_max_edge = None
 
     def readback(self):
         self.readbacks += 1
         return self._array
+
+    def readback_downsampled(self, max_edge: int):
+        self.downsampled_readbacks += 1
+        self.last_max_edge = max_edge
+        scale = max_edge / max(self.width, self.height)
+        h = max(1, round(self.height * scale))
+        w = max(1, round(self.width * scale))
+        return np.broadcast_to(self._array[:1, :1, :], (h, w, self._array.shape[2])).copy()
 
 
 class TestControllerDoesNotReadBack(unittest.TestCase):
@@ -115,6 +125,18 @@ class TestWorkerAttachesTheHostCopy(unittest.TestCase):
         metrics = self._run(self._worker(tex), task)
         self.assertEqual(tex.readbacks, 1)
         self.assertIsInstance(metrics.get("thumbnail_source"), np.ndarray)
+
+    def test_large_gpu_render_uses_downsampled_readback_for_thumbnail(self):
+        """A GPU render larger than the thumbnail bound downsamples in VRAM before readback."""
+        from negpy.kernel.system.config import APP_CONFIG
+
+        tex = _FakeTexture(np.full((1, 1, 4), 0.4, dtype=np.float32))
+        tex.width, tex.height = 4096, 3276
+        metrics = self._run(self._worker(tex), self._task(tex, wants_thumbnail=True))
+        self.assertEqual(tex.readbacks, 0, "must not read back full texture for a thumbnail")
+        self.assertEqual(tex.downsampled_readbacks, 1)
+        self.assertEqual(tex.last_max_edge, APP_CONFIG.thumbnail_size * 2)
+        self.assertEqual(metrics["thumbnail_source"].shape, (410, 512, 3))
 
     def test_key_is_always_assigned_so_a_stale_copy_cannot_survive(self):
         """The controller merges metrics into a running dict, so a render that produced

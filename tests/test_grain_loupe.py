@@ -145,3 +145,44 @@ def test_leaving_the_canvas_parks_the_cursor():
     overlay = _loupe_overlay()
     overlay.leaveEvent(None)
     assert not overlay._view_rect.contains(overlay._mouse_pos)
+
+
+def test_gpu_frame_loupe_reads_only_the_patch_region(qapp):
+    """On a GPU frame without an export buffer, the loupe reads only its patch via readback_region."""
+
+    class _FakeGPUTex:
+        width = 4096
+        height = 3276
+        full_readbacks = 0
+        region_calls: list = []
+
+        def readback(self):
+            self.full_readbacks += 1
+            return np.zeros((self.height, self.width, 4), dtype=np.float32)
+
+        def readback_region(self, x: int, y: int, rw: int, rh: int):
+            self.region_calls.append((x, y, rw, rh))
+            patch = np.zeros((rh, rw, 4), dtype=np.float32)
+            patch[:, rw // 2 :, :3] = 1.0
+            patch[:, :, 3] = 1.0
+            return patch
+
+    state = AppState()
+    state.grain_focuser = True
+    overlay = CanvasOverlay(state)
+    overlay._view_rect = QRectF(0, 0, 800, 640)
+    overlay._current_size = (4096, 3276)
+    overlay._display_cs = "sRGB"
+    tex = _FakeGPUTex()
+    overlay._gpu_texture = tex
+    overlay._mouse_pos = QPointF(400, 320)
+
+    pixmap = QPixmap(800, 640)
+    painter = QPainter(pixmap)
+    overlay._draw_grain_loupe(painter)
+    painter.end()
+
+    assert tex.full_readbacks == 0
+    assert len(tex.region_calls) == 1
+    _, _, rw, rh = tex.region_calls[0]
+    assert 0 < rw < 512 and 0 < rh < 512

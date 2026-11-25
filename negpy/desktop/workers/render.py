@@ -480,9 +480,16 @@ class RenderWorker(QObject):
                 # Taken here because the engine recycles its stage textures next frame. Always
                 # assigned: the controller merges metrics into a running dict, so a stale entry
                 # would be filed under this asset's key.
-                metrics["thumbnail_source"] = (
-                    np.ascontiguousarray(result.readback()[:, :, :3]) if task.wants_thumbnail and isinstance(result, GPUTexture) else None
-                )
+                if task.wants_thumbnail and isinstance(result, GPUTexture):
+                    thumb_max = APP_CONFIG.thumbnail_size * 2
+                    rb = (
+                        result.readback_downsampled(thumb_max)
+                        if hasattr(result, "readback_downsampled") and max(result.width, result.height) > thumb_max
+                        else result.readback()
+                    )
+                    metrics["thumbnail_source"] = np.ascontiguousarray(rb[:, :, :3])
+                else:
+                    metrics["thumbnail_source"] = None
                 timing.lap("thumbnail readback")
             h, w = task.buffer.shape[:2] if isinstance(task.buffer, np.ndarray) else (0, 0)
             # A drag renders many frames a second, so only a settled render logs at info.

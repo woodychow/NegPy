@@ -1965,18 +1965,39 @@ class CanvasOverlay(QWidget):
         on_print = self.state.peek_frame is None and not self.state.canvas_value("crop_preview_full")
         shows_export = bool(self.state.canvas_value("export_view"))
         if shows_export or view is None or not on_print:
-            img, buf = self._host_qimage(), self._host_buffer()
-            if img is None:
-                return
-            if shows_export:
-                side, tail = export_side, tr("export {width} × {height} px", width=img.width(), height=img.height())
+            if self._qimage is None and self._gpu_texture is not None and hasattr(self._gpu_texture, "readback_region"):
+                tw, th = self._gpu_texture.width, self._gpu_texture.height
+                if shows_export:
+                    side, tail = export_side, tr("export {width} × {height} px", width=tw, height=th)
+                else:
+                    side = 2.0 * _LOUPE_RADIUS_PX / _LOUPE_PREVIEW_MAG
+                    tail = tr("rendering export…") if on_print else tr("preview res")
+                scale = tw / self._view_rect.width()
+                cx, cy = (mx - self._view_rect.x()) * scale, (my - self._view_rect.y()) * scale
+                src_full = loupe_src_rect(tw, th, cx, cy, side)
+                x0 = max(0, min(int(src_full.x()), tw - 1))
+                y0 = max(0, min(int(src_full.y()), th - 1))
+                rw, rh = max(1, int(src_full.width())), max(1, int(src_full.height()))
+                try:
+                    patch = np.ascontiguousarray(self._gpu_texture.readback_region(x0, y0, rw, rh)[:, :, :3])
+                except Exception:
+                    return
+                img = ImageConverter.to_qimage(patch, self._display_cs, self._monitor_icc_bytes, self._proof)
+                src = QRectF(0.0, 0.0, img.width(), img.height())
+                buf = patch
             else:
-                side = 2.0 * _LOUPE_RADIUS_PX / _LOUPE_PREVIEW_MAG
-                tail = tr("rendering export…") if on_print else tr("preview res")
-            # Buffer px per screen px: the loupe works in buffer space, not content space.
-            scale = img.width() / self._view_rect.width()
-            cx, cy = (mx - self._view_rect.x()) * scale, (my - self._view_rect.y()) * scale
-            src = loupe_src_rect(img.width(), img.height(), cx, cy, side)
+                img, buf = self._host_qimage(), self._host_buffer()
+                if img is None:
+                    return
+                if shows_export:
+                    side, tail = export_side, tr("export {width} × {height} px", width=img.width(), height=img.height())
+                else:
+                    side = 2.0 * _LOUPE_RADIUS_PX / _LOUPE_PREVIEW_MAG
+                    tail = tr("rendering export…") if on_print else tr("preview res")
+                # Buffer px per screen px: the loupe works in buffer space, not content space.
+                scale = img.width() / self._view_rect.width()
+                cx, cy = (mx - self._view_rect.x()) * scale, (my - self._view_rect.y()) * scale
+                src = loupe_src_rect(img.width(), img.height(), cx, cy, side)
         else:
             buf = view["buffer"]
             h, w = buf.shape[:2]

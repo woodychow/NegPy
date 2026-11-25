@@ -71,6 +71,29 @@ class TestGPUInfrastructure(unittest.TestCase):
         self.assertIsNone(tex.texture)
         self.assertIsNone(tex.view)
 
+    def test_gpu_texture_readback_downsampled(self):
+        """GPUTexture.readback_downsampled area-averages in VRAM before reading back."""
+        if not self.gpu.is_available:
+            self.skipTest("GPU not available")
+
+        data = np.empty((400, 600, 3), dtype=np.float32)
+        checker = ((np.indices((400, 600)).sum(axis=0) % 2) * 0.6 + 0.2).astype(np.float32)
+        data[:, :, 0] = checker
+        data[:, :, 1] = 0.3
+        data[:, :, 2] = 0.7
+
+        tex = GPUTexture(600, 400)
+        try:
+            tex.upload(data)
+            small = tex.readback_downsampled(150)
+            self.assertEqual(small.shape, (100, 150, 4))
+            np.testing.assert_allclose(small[:, :, 0], 0.5, atol=1e-4)
+            np.testing.assert_allclose(small[:, :, 1], 0.3, atol=1e-4)
+            np.testing.assert_allclose(small[:, :, 2], 0.7, atol=1e-4)
+            np.testing.assert_allclose(small[:, :, 3], 1.0, atol=1e-4)
+        finally:
+            tex.destroy()
+
     def test_gpu_buffer(self):
         """GPUBuffer should initialize and upload data."""
         if not self.gpu.is_available:
